@@ -1,0 +1,12 @@
+# build
+/.build/
+/bin/
+
+# python
+__pycache__/
+*.pyc
+
+# editors / os
+.vs/
+.vscode/
+Thumbs.db
