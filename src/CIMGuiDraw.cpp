@@ -1,9 +1,12 @@
 #include "save_state.hpp"
 #include "CIMGuiDraw.h"
+#include "DwmPrimitives.h"
 #include <wrl/client.h>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 #include <algorithm>
+#include <vector>
 using Microsoft::WRL::ComPtr;
 namespace {
 struct ContextScope {
@@ -18,7 +21,25 @@ bool Color(DrawColor& c) {
     return true;
 }
 bool Thickness(float t) { return std::isfinite(t) && t > 0 && t <= 10000; }
-void DrawCommand(DrawInfo& p, unsigned& clipDepth) {
+int ClampSegments(int segments) { return (std::max)(3, (std::min)(512, segments)); }
+
+// Copies a point run out of the frame's pool. Returns false when the range is invalid,
+// which keeps a corrupt producer from reading out of bounds.
+bool CollectPoints(const DRAWARR& frame, const DrawPointsStr& p, std::vector<ImVec2>& out) {
+    if (p.m_First < 0 || p.m_Count < 2 || p.m_Count > MAX_POINTS) return false;
+    if (p.m_First > MAX_POINTS - p.m_Count) return false;
+    out.resize(static_cast<size_t>(p.m_Count));
+    for (int i = 0; i < p.m_Count; ++i) {
+        const DwmVec2& source = frame.m_Points[p.m_First + i];
+        if (!Position(source.x) || !Position(source.y)) return false;
+        out[static_cast<size_t>(i)] = ImVec2(source.x, source.y);
+    }
+    return true;
+}
+
+// p is non-const because Color() clamps out-of-range channels in place before drawing.
+void DrawCommand(const DRAWARR& frame, DrawInfo& p, const ImFont* const* fonts,
+    const float* sizes, unsigned& clipDepth) {
     switch(p.m_DrawType) {
     case ClipPush_M: {
         const auto& r = p.From.Rect;
@@ -33,22 +54,27 @@ void DrawCommand(DrawInfo& p, unsigned& clipDepth) {
         if (clipDepth) { ImGui::GetOverlayDrawList()->PopClipRect(); --clipDepth; }
         break;
     case Text_M: case Text2_M: {
-        auto& t=p.From.Text;
+        auto t=p.From.Text;
         if(!Position(t.m_X)||!Position(t.m_Y)||!Color(t.m_Color)) break;
         t.m_Str[BUF_LEN-1]='\0';
-        if(p.m_DrawType==Text_M) DrawNewText(t.m_X,t.m_Y,t.m_Color,t.m_Outlined,t.m_Str);
-        else DrawNewTextStr(t.m_X,t.m_Y,t.m_Color,t.m_Outlined,t.m_Str);
+        // An out-of-range index degrades to the default font rather than dropping the text.
+        const int index = (t.m_FontIndex >= 0 && t.m_FontIndex < MAX_FONTS) ? t.m_FontIndex : 0;
+        const ImFont* font = fonts[index];
+        float size = t.m_Size > 0 ? t.m_Size : sizes[index];
+        if (size <= 0) size = ImGuiDx11_defaultFontSize();
+        if(p.m_DrawType==Text_M) DrawNewTextEx(font, size, t.m_X, t.m_Y, t.m_Color, t.m_Outlined, t.m_Str);
+        else DrawNewTextEx(font, size, t.m_X, t.m_Y, t.m_Color, t.m_Outlined, t.m_Str);
         break;
     }
     case CircleFill_M: {
         auto& c=p.From.CircleFill;
         if(!Position(c.m_X)||!Position(c.m_Y)||!Position(c.m_Radius)||c.m_Radius<=0||!Color(c.m_Color)) break;
-        DrawCircleFilled(c.m_X,c.m_Y,c.m_Radius,c.m_Color,(std::max)(3,(std::min)(512,c.m_Segments))); break;
+        DrawCircleFilled(c.m_X,c.m_Y,c.m_Radius,c.m_Color,ClampSegments(c.m_Segments)); break;
     }
     case Circle_M: {
         auto& c=p.From.Circle;
         if(!Position(c.m_X)||!Position(c.m_Y)||!Position(c.m_Radius)||c.m_Radius<=0||!Color(c.m_Color)||!Thickness(c.m_thickness)) break;
-        DrawCircle(c.m_X,c.m_Y,c.m_Radius,c.m_Color,(std::max)(3,(std::min)(512,c.m_Segments)),c.m_thickness); break;
+        DrawCircle(c.m_X,c.m_Y,c.m_Radius,c.m_Color,ClampSegments(c.m_Segments),c.m_thickness); break;
     }
     case Rect_M: case RectEx_M: {
         auto& r=p.From.Rect;
@@ -66,6 +92,50 @@ void DrawCommand(DrawInfo& p, unsigned& clipDepth) {
         auto& l=p.From.Line;
         if(!Position(l.m_X1)||!Position(l.m_Y1)||!Position(l.m_X2)||!Position(l.m_Y2)||!Color(l.m_Color)||!Thickness(l.thickness)) break;
         DrawLine(l.m_X1,l.m_Y1,l.m_X2,l.m_Y2,l.m_Color,l.thickness); break;
+    }
+    case RoundRect_M: {
+        auto& r=p.From.RoundRect;
+        if(!Position(r.m_X)||!Position(r.m_Y)||!Position(r.m_W)||!Position(r.m_H)||!Position(r.m_Radius)||
+           r.m_W<0||r.m_H<0||r.m_Radius<0||!Color(r.m_Color)) break;
+        const bool filled = r.m_Filled != 0;
+        // A stroked rounded rect needs a valid thickness; a filled one does not.
+        if(!filled && !Thickness(r.m_thickness)) break;
+        DrawRoundRect(r.m_X,r.m_Y,r.m_W,r.m_H,r.m_Radius,r.m_Color,r.m_thickness,filled);
+        break;
+    }
+    case Ellipse_M: {
+        auto& e=p.From.Ellipse;
+        if(!Position(e.m_X)||!Position(e.m_Y)||!Position(e.m_RX)||!Position(e.m_RY)||
+           e.m_RX<=0||e.m_RY<=0||!Color(e.m_Color)) break;
+        const bool filled = e.m_Filled != 0;
+        if(!filled && !Thickness(e.m_thickness)) break;
+        DrawEllipse(e.m_X,e.m_Y,e.m_RX,e.m_RY,e.m_Color,e.m_thickness,ClampSegments(e.m_Segments),filled);
+        break;
+    }
+    case Points_M: {
+        auto& pnt=p.From.Points;
+        if(!Color(pnt.m_Color)) break;
+        const bool filled = pnt.m_Filled != 0;
+        if(!filled && !Thickness(pnt.m_thickness)) break;
+        std::vector<ImVec2> points;
+        if(!CollectPoints(frame,pnt,points)) break;
+        DrawPoints(points.data(),static_cast<int>(points.size()),pnt.m_Color,pnt.m_thickness,
+            filled,pnt.m_Closed!=0);
+        break;
+    }
+    case Arc_M: {
+        auto& a=p.From.Arc;
+        if(!Position(a.m_X)||!Position(a.m_Y)||!Position(a.m_Radius)||!Position(a.m_Start)||!Position(a.m_End)||
+           a.m_Radius<=0||!Color(a.m_Color)||!Thickness(a.m_thickness)) break;
+        const int segments = (std::max)(2,(std::min)(1024,a.m_Segments));
+        std::vector<ImVec2> points(static_cast<size_t>(segments)+1);
+        const float step=(a.m_End-a.m_Start)/static_cast<float>(segments);
+        for(int i=0;i<=segments;++i){
+            const float angle=(a.m_Start+step*static_cast<float>(i))*3.14159265358979323846f/180.0f;
+            points[static_cast<size_t>(i)]=ImVec2(a.m_X+a.m_Radius*std::cos(angle),a.m_Y+a.m_Radius*std::sin(angle));
+        }
+        DrawPoints(points.data(),segments+1,a.m_Color,a.m_thickness,false,false);
+        break;
     }
     default: break;
     }
@@ -102,7 +172,7 @@ bool CIMGuiDraw::InitMessage() {
         const auto wait=WaitForSingleObject(mutex,0);
         if(wait==WAIT_OBJECT_0 || wait==WAIT_ABANDONED) {
             valid=ValidDrawHeader(shared);
-            if(valid && wait==WAIT_ABANDONED) { shared->m_DrawCount=0; ++shared->frameNumber; }
+            if(valid && wait==WAIT_ABANDONED) { shared->m_DrawCount=0; shared->m_PointCount=0; ++shared->frameNumber; }
             ReleaseMutex(mutex);
         }
     }
@@ -113,7 +183,7 @@ bool CIMGuiDraw::InitMessage() {
         return false;
     }
     m_mutex=mutex; m_mapping=mapping; m_shared=shared;
-    OutputDebugStringA("[DwmDraw] Shared protocol v3 connected.\n");
+    OutputDebugStringA("[DwmDraw] Shared protocol v4 connected.\n");
     return true;
 }
 bool CIMGuiDraw::Snapshot() {
@@ -122,14 +192,24 @@ bool CIMGuiDraw::Snapshot() {
     if(wait!=WAIT_OBJECT_0 && wait!=WAIT_ABANDONED) return false;
     bool valid=ValidDrawHeader(m_shared);
     if(valid) {
-        if(wait==WAIT_ABANDONED) { m_shared->m_DrawCount=0; ++m_shared->frameNumber; }
+        if(wait==WAIT_ABANDONED) { m_shared->m_DrawCount=0; m_shared->m_PointCount=0; ++m_shared->frameNumber; }
         const int count=m_shared->m_DrawCount;
-        if(count<0 || count>MAX_DRAW) {
+        const int points=m_shared->m_PointCount;
+        const int fonts=m_shared->m_FontCount;
+        if(count<0 || count>MAX_DRAW || points<0 || points>MAX_POINTS || fonts<0 || fonts>MAX_FONTS) {
             m_frame.m_DrawCount=0;
-            OutputDebugStringA("[DwmDraw] Rejected invalid command count.\n");
+            m_frame.m_PointCount=0;
+            m_frame.m_FontCount=0;
+            OutputDebugStringA("[DwmDraw] Rejected invalid frame header.\n");
         } else {
             m_frame.m_DrawCount=count;
-            memcpy(m_frame.m_DrawInfoArr,m_shared->m_DrawInfoArr,count*sizeof(DrawInfo));
+            m_frame.m_PointCount=points;
+            m_frame.m_FontCount=fonts;
+            m_frame.m_Overflow=m_shared->m_Overflow;
+            memcpy(m_frame.m_DrawInfoArr,m_shared->m_DrawInfoArr,static_cast<size_t>(count)*sizeof(DrawInfo));
+            // Points are copied in one block; only the first `points` entries are live.
+            memcpy(m_frame.m_Points,m_shared->m_Points,static_cast<size_t>(points)*sizeof(DwmVec2));
+            if(fonts>0) memcpy(m_frame.m_Fonts,m_shared->m_Fonts,static_cast<size_t>(fonts)*sizeof(DwmFontSpec));
         }
     }
     ReleaseMutex(m_mutex);
@@ -143,11 +223,30 @@ bool CIMGuiDraw::InitMiGuiDx11(IDXGISwapChain* chain,ID3D11Device* device) {
     m_context=ImGui::CreateContext();
     if(!m_context) { ImGui::SetCurrentContext(previous); return false; }
     ImGui::SetCurrentContext(m_context);
+    // Fonts resolved so far belong to the destroyed atlas; drop the cache with it.
+    m_fonts = DwmFontLibrary();
+    for (int i = 0; i < MAX_FONTS; ++i) { m_resolvedFonts[i] = nullptr; m_resolvedSizes[i] = 0; }
     const bool ok=ImGuiDx11_init(chain,device);
     if(!ok) { ImGui::DestroyContext(m_context); m_context=nullptr; }
     ImGui::SetCurrentContext(previous);
     QueryPerformanceFrequency(&m_frequency);
     return ok;
+}
+void CIMGuiDraw::PrepareFonts() {
+    // Slot 0 is the built-in default font: no ImFont, and the renderer's default size.
+    m_resolvedFonts[0] = nullptr;
+    m_resolvedSizes[0] = ImGuiDx11_defaultFontSize();
+    const int count = m_frame.m_FontCount;
+    for (int i = 1; i < count && i < MAX_FONTS; ++i) {
+        float size = ImGuiDx11_defaultFontSize();
+        m_resolvedFonts[i] = m_fonts.acquire(m_frame.m_Fonts[i], size);
+        m_resolvedSizes[i] = size;
+    }
+    // A font added now invalidates the atlas texture; re-upload it before NewFrame() so
+    // the glyphs used this frame actually exist in the texture.
+    if (m_fonts.consumeAtlasDirty() && !ImGuiDx11_refreshFontTexture()) {
+        OutputDebugStringA("[DwmDraw] Font texture refresh failed.\n");
+    }
 }
 bool CIMGuiDraw::ImGuiDx11Draw(IDXGISwapChain* chain) {
     if(!chain || !InitMessage() || !Snapshot()) return false;
@@ -161,6 +260,8 @@ bool CIMGuiDraw::ImGuiDx11Draw(IDXGISwapChain* chain) {
     if(FAILED(chain->GetBuffer(0,IID_PPV_ARGS(&buffer))) || FAILED(device->CreateRenderTargetView(buffer.Get(),nullptr,&target))) return false;
     D3D11_TEXTURE2D_DESC desc{}; buffer->GetDesc(&desc);
     if(!desc.Width || !desc.Height) return false;
+    // Resolve fonts before NewFrame(): the atlas is Locked from NewFrame() to Render().
+    PrepareFonts();
     ImGuiIO& io=ImGui::GetIO();
     LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
     const double delta=m_lastTime.QuadPart && m_frequency.QuadPart ? double(now.QuadPart-m_lastTime.QuadPart)/double(m_frequency.QuadPart) : 1.0/60.0;
@@ -170,7 +271,8 @@ bool CIMGuiDraw::ImGuiDx11Draw(IDXGISwapChain* chain) {
     ImGui_ImplDX11_NewFrame();
     ImGui::NewFrame();
     unsigned clipDepth = 0;
-    for(int i=0;i<m_frame.m_DrawCount;++i) DrawCommand(m_frame.m_DrawInfoArr[i], clipDepth);
+    // DrawInfo is mutated in place by the per-command colour clamping, so iterate non-const.
+    for(int i=0;i<m_frame.m_DrawCount;++i) DrawCommand(m_frame, m_frame.m_DrawInfoArr[i], m_resolvedFonts, m_resolvedSizes, clipDepth);
     // A full command buffer may have dropped a trailing pop. Never leak clip state into the next frame.
     while (clipDepth) { ImGui::GetOverlayDrawList()->PopClipRect(); --clipDepth; }
     ImGui::Render();

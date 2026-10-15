@@ -1,6 +1,9 @@
 #include "DwmScrollPanel.h"
+#include "DwmHotkeys.h"
+#include <algorithm>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include <stdexcept>
@@ -15,19 +18,32 @@ DwmColor Color(unsigned rgba) {
         static_cast<std::uint8_t>(rgba >> 8), static_cast<std::uint8_t>(rgba)};
 }
 struct Panel { DwmScrollPanel value; bool inputEnabled = true; };
+// A font descriptor registered through DD_FontAdd. The DLL owns it so the Python layer can
+// pass a small stable handle instead of re-sending the family name on every text call.
+struct FontDesc { std::string family; float size = 0; int ranges = DwmRanges_Auto; };
 struct Session {
     DwmDraw draw;
     DWORD thread = GetCurrentThreadId();
     bool frame = false;
+    bool overflow = false;
     HWND receiver = nullptr;
     DWORD receiverPid = 0;
     Id nextPanel = 1;
+    // Index 0 is the renderer default font; user fonts start at 1.
+    std::vector<FontDesc> fonts;
     std::unordered_map<Id, std::unique_ptr<Panel>> panels;
     std::vector<Id> active;
-    Session(const wchar_t* mapping, const wchar_t* mutex) : draw(mapping, mutex) {}
+    // Hotkey ids registered by this session; unregistered when the session dies.
+    std::vector<int> hotkeys;
+    Session(const wchar_t* mapping, const wchar_t* mutex) : draw(mapping, mutex) { fonts.emplace_back(); }
     void EndPanels() {
         while (!active.empty()) { panels.at(active.back())->value.end(draw); active.pop_back(); }
     }
+    void ReleaseHotkeys() {
+        for (int id : hotkeys) DwmHotkeys::Unregister(id);
+        hotkeys.clear();
+    }
+    ~Session() { ReleaseHotkeys(); }
 };
 struct Registry { std::mutex mutex; Id next = 1; std::unordered_map<Id, std::unique_ptr<Session>> sessions; };
 // Explicit destroy performs cleanup outside DllMain; do not run User32 destructors under the loader lock.
@@ -54,7 +70,8 @@ template<class Function> int Draw(Id id, Function function) noexcept {
     return Action(id, [&](Session& session) { Require(session.frame, ERROR_INVALID_STATE); function(session.draw); });
 }
 }
-API unsigned DD_ApiVersion() { return 2; }
+// Version 3 adds text fonts/sizes, extra geometry primitives and global shortcuts.
+API unsigned DD_ApiVersion() { return 3; }
 API Id DD_Create(const wchar_t* mapping, const wchar_t* mutex) noexcept {
     try {
         std::lock_guard<std::mutex> lock(registry().mutex);
@@ -70,6 +87,7 @@ API int DD_Destroy(Id id) noexcept {
     return Action(id, [&](Session& session) {
         session.EndPanels();
         if (session.frame) session.draw.cancel(); else session.draw.clear();
+        session.ReleaseHotkeys();
         session.panels.clear(); registry().sessions.erase(id);
     });
 }
@@ -83,8 +101,16 @@ API int DD_Begin(Id id) noexcept {
 API int DD_End(Id id, int cancel) noexcept {
     return Action(id, [&](Session& s) {
         Require(s.frame, ERROR_INVALID_STATE); s.EndPanels();
-        if (cancel) s.draw.cancel(); else s.draw.end(); s.frame = false;
+        if (cancel) s.draw.cancel(); else s.draw.end();
+        // lastFrameOverflowed() is only meaningful after end()/cancel().
+        s.overflow = s.draw.overflowed();
+        s.frame = false;
     });
+}
+API int DD_Overflow(Id id) noexcept {
+    int overflow = 0;
+    const int ok = Action(id, [&](Session& s) { overflow = s.overflow ? 1 : 0; });
+    return ok ? overflow : -1;
 }
 API int DD_Clear(Id id) noexcept {
     bool cleared = false;
@@ -96,6 +122,40 @@ API int DD_Position(Id id, float x, float y) noexcept {
 }
 API int DD_Text(Id id, float x, float y, const char* utf8, unsigned rgba, int outlined) noexcept {
     return Draw(id, [&](DwmDraw& draw) { Require(utf8 != nullptr); draw.text(x, y, utf8, Color(rgba), outlined != 0); });
+}
+// fontIndex comes from DD_FontAdd; size <= 0 uses the size recorded with that font.
+API int DD_TextEx(Id id, float x, float y, const char* utf8, unsigned rgba, int outlined,
+    int fontIndex, float size) noexcept {
+    // Uses Action (not Draw) because the font descriptor lives on the Session, not the
+    // DwmDraw facade; the frame requirement is asserted explicitly instead.
+    return Action(id, [&](Session& s) {
+        Require(s.frame, ERROR_INVALID_STATE);
+        Require(utf8 != nullptr);
+        Require(fontIndex >= 0 && static_cast<size_t>(fontIndex) < s.fonts.size());
+        const FontDesc& desc = s.fonts[static_cast<size_t>(fontIndex)];
+        DwmFont font;
+        font.family = desc.family;
+        font.size = size > 0 ? size : desc.size;
+        font.ranges = desc.ranges;
+        s.draw.text(x, y, utf8, font, Color(rgba), outlined != 0);
+    });
+}
+// Registers a font family (or a .ttf path) with a size and glyph range. Returns an index
+// for DD_TextEx; identical requests reuse the same index.
+API int DD_FontAdd(Id id, const char* family, float size, int ranges) noexcept {
+    int index = 0;
+    const int ok = Action(id, [&](Session& s) {
+        Require(ranges >= 0 && ranges < DwmRanges_Count);
+        const std::string name = family ? family : "";
+        for (size_t i = 1; i < s.fonts.size(); ++i) {
+            if (s.fonts[i].family == name && s.fonts[i].size == size && s.fonts[i].ranges == ranges) {
+                index = static_cast<int>(i); return;
+            }
+        }
+        s.fonts.push_back(FontDesc{ name, size, ranges });
+        index = static_cast<int>(s.fonts.size()) - 1;
+    });
+    return ok ? index : -1;
 }
 API int DD_Rect(Id id, float x, float y, float w, float h, unsigned rgba, float thickness, int kind) noexcept {
     return Draw(id, [&](DwmDraw& draw) {
@@ -120,6 +180,45 @@ API int DD_Clip(Id id, float x, float y, float w, float h, int push) noexcept {
 API int DD_Fps(Id id, float* result) noexcept {
     return Action(id, [&](Session& s) { Require(result != nullptr); *result = s.draw.fps(); });
 }
+API int DD_RoundRect(Id id, float x, float y, float w, float h, float radius,
+    unsigned rgba, float thickness, int filled) noexcept {
+    return Draw(id, [&](DwmDraw& draw) {
+        if (filled) draw.filledRoundRect(x, y, w, h, radius, Color(rgba));
+        else draw.roundRect(x, y, w, h, radius, Color(rgba), thickness);
+    });
+}
+API int DD_Ellipse(Id id, float x, float y, float rx, float ry, unsigned rgba,
+    float thickness, int segments, int filled) noexcept {
+    return Draw(id, [&](DwmDraw& draw) {
+        if (filled) draw.filledEllipse(x, y, rx, ry, Color(rgba), segments);
+        else draw.ellipse(x, y, rx, ry, Color(rgba), thickness, segments);
+    });
+}
+// xy is a flat [x0,y0,x1,y1,...] array of `count` points in content-local coordinates.
+API int DD_Polygon(Id id, const float* xy, int count, unsigned rgba, float thickness,
+    int filled, int closed) noexcept {
+    return Draw(id, [&](DwmDraw& draw) {
+        Require(xy != nullptr);
+        Require(count >= 2 && count <= MAX_POINTS);
+        std::vector<DwmVec2> points(static_cast<size_t>(count));
+        for (int i = 0; i < count; ++i) points[static_cast<size_t>(i)] = { xy[i * 2], xy[i * 2 + 1] };
+        if (filled && count >= 3) draw.polygon(points.data(), count, Color(rgba), thickness, true, closed != 0);
+        else if (count >= 3 && closed) draw.polygon(points.data(), count, Color(rgba), thickness, false, true);
+        else draw.polyline(points.data(), count, Color(rgba), thickness);
+    });
+}
+API int DD_Bezier(Id id, float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3,
+    unsigned rgba, float thickness, int segments) noexcept {
+    return Draw(id, [&](DwmDraw& draw) {
+        draw.bezier(x0, y0, x1, y1, x2, y2, x3, y3, Color(rgba), thickness, segments);
+    });
+}
+API int DD_Arc(Id id, float x, float y, float radius, float start, float end,
+    unsigned rgba, float thickness, int segments) noexcept {
+    return Draw(id, [&](DwmDraw& draw) {
+        draw.arc(x, y, radius, start, end, Color(rgba), thickness, segments);
+    });
+}
 API int DD_Receiver(Id id, HWND window) noexcept {
     return Action(id, [&](Session& s) {
         Require(IsWindow(window) != FALSE, ERROR_INVALID_WINDOW_HANDLE);
@@ -141,6 +240,36 @@ API int DD_Poll(Id id, int stopOnEscape) noexcept {
         if (stopOnEscape && (GetAsyncKeyState(VK_ESCAPE) & 0x8000)) running = false;
     });
     return ok ? (running ? 1 : 0) : -1;
+}
+// Registers a global shortcut. vk is a virtual-key code, modifiers is MOD_ALT|MOD_CONTROL|
+// MOD_SHIFT|MOD_WIN. Returns a hotkey id (>0) or 0 on failure.
+API int DD_HotkeyAdd(Id id, int vk, int modifiers, int repeat) noexcept {
+    int hotkey = 0;
+    const int ok = Action(id, [&](Session& s) {
+        hotkey = DwmHotkeys::Register(vk, modifiers, repeat != 0);
+        Require(hotkey != 0, GetLastError() ? GetLastError() : ERROR_INVALID_PARAMETER);
+        s.hotkeys.push_back(hotkey);
+    });
+    return ok ? hotkey : 0;
+}
+API int DD_HotkeyRemove(Id id, int hotkey) noexcept {
+    return Action(id, [&](Session& s) {
+        auto found = std::find(s.hotkeys.begin(), s.hotkeys.end(), hotkey);
+        Require(found != s.hotkeys.end(), ERROR_INVALID_HANDLE);
+        Require(DwmHotkeys::Unregister(hotkey), GetLastError());
+        s.hotkeys.erase(found);
+    });
+}
+// Consumes and reports whether the shortcut fired since the previous call.
+API int DD_HotkeyFired(Id id, int hotkey) noexcept {
+    int fired = 0;
+    const int ok = Action(id, [&](Session&) { fired = DwmHotkeys::Consume(hotkey) ? 1 : 0; });
+    return ok ? fired : -1;
+}
+API int DD_KeyDown(Id id, int vk) noexcept {
+    int down = 0;
+    const int ok = Action(id, [&](Session&) { down = DwmHotkeys::IsDown(vk) ? 1 : 0; });
+    return ok ? down : -1;
 }
 API Id DD_PanelCreate(Id id) noexcept {
     Id panelId = 0;

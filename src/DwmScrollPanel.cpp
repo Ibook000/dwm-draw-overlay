@@ -1,4 +1,5 @@
 #include "DwmScrollPanel.h"
+#include "DwmHotkeys.h"
 #include <algorithm>
 #include <vector>
 
@@ -67,12 +68,9 @@ void DwmScrollPanel::detachMouseWheel() {
     }
 }
 bool DwmScrollPanel::pollEvents() {
-    MSG message{};
-    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
-        if (message.message == WM_QUIT) return false;
-        TranslateMessage(&message); DispatchMessageW(&message);
-    }
-    return true;
+    // Delegates so WM_HOTKEY events are recorded for DwmHotkeys::Consume() rather than
+    // being dispatched and lost by whichever loop happens to drain the queue.
+    return DwmHotkeys::PumpMessages();
 }
 LRESULT CALLBACK DwmScrollPanel::MouseHook(int code, WPARAM message, LPARAM data) {
     if (code == HC_ACTION && message == WM_MOUSEWHEEL) {

@@ -1,6 +1,7 @@
 #pragma once
 #include "MyImGui.h"
 #include "DrawProtocol.h"
+#include "DwmFontLibrary.h"
 #include <string>
 
 class CIMGuiDraw {
@@ -17,10 +18,17 @@ public:
 private:
     bool Snapshot();
     void ResetRenderer();
+    // Resolves this frame's font table into ImFont pointers. Must run before NewFrame()
+    // because the atlas is Locked between NewFrame() and Render().
+    void PrepareFonts();
     HANDLE m_mapping = nullptr;
     HANDLE m_mutex = nullptr;
     PDRWARR m_shared = nullptr;
     DRAWARR m_frame{};
+    // Resolved font per frame-table slot; index 0 is the renderer default (nullptr).
+    ImFont* m_resolvedFonts[MAX_FONTS]{};
+    float m_resolvedSizes[MAX_FONTS]{};
+    DwmFontLibrary m_fonts;
     ImGuiContext* m_context = nullptr;
     LARGE_INTEGER m_frequency{}, m_lastTime{};
     ULONGLONG m_nextConnect = 0;

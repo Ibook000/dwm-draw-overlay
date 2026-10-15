@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
+from dwm_draw import _PROTOCOL_VERSION
 
 
 def child(result, orphan=False, legacy=False):
@@ -20,8 +21,9 @@ def child(result, orphan=False, legacy=False):
                 old_process = old._process
                 old._user32.RemovePropW.argtypes = [C.c_void_p, C.c_wchar_p]
                 old._user32.RemovePropW.restype = C.c_void_p
-                if old._user32.RemovePropW(old._window, "DwmDraw.ProtocolVersion") != 3:
-                    raise AssertionError("Could not simulate the old renderer properties")
+                removed = old._user32.RemovePropW(old._window, "DwmDraw.ProtocolVersion")
+                if removed != _PROTOCOL_VERSION:
+                    raise AssertionError(f"Could not simulate the old renderer properties: {removed}")
                 start_renderer = DwmDraw._start_renderer
                 attempted = []
                 def denied_legacy_message(draw, executable):
@@ -65,6 +67,10 @@ def child(result, orphan=False, legacy=False):
             if not draw._user32.IsWindowVisible(draw._window):
                 raise AssertionError("Python show failed")
             panel.scroll_to(40)
+            # Exercise fonts, sizes and the full geometry set through the real renderer.
+            hotkey = draw.hotkey("ctrl+alt+f10")
+            small = draw.font("Consolas", 11)
+            large = draw.font("SimHei", 30)
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 if not draw.running(stop_on_escape=False):
@@ -74,11 +80,32 @@ def child(result, orphan=False, legacy=False):
                         with panel:
                             draw.text(12, 60, "Python 自动启动和滚动面板")
                             draw.rect(12, 100, 100, 40, (255, 0, 0), filled=True)
+                        draw.text(300, 30, "小号等宽", (200, 220, 255), font=small)
+                        draw.text(300, 60, "大号黑体", (255, 220, 100), font=large)
+                        draw.text(300, 100, "按字号覆盖", (150, 255, 150), font="SimHei", size=18)
+                        draw.filled_round_rect(300, 130, 120, 40, 10, (40, 90, 160, 200))
+                        draw.round_rect(300, 180, 120, 40, 10, (255, 255, 255), thickness=2)
+                        draw.filled_ellipse(360, 250, 55, 30, (90, 200, 120, 180))
+                        draw.ellipse(360, 250, 55, 30, (255, 255, 255), thickness=2)
+                        # A concave star exercises the ear-clipping fill path.
+                        draw.polygon([(500, 300), (515, 340), (560, 340), (525, 365),
+                                      (540, 405), (500, 380), (460, 405), (475, 365),
+                                      (440, 340), (485, 340)], (255, 200, 60), filled=True)
+                        draw.bezier(500, 420, 540, 380, 560, 470, 600, 430,
+                                    (120, 200, 255), thickness=3, segments=24)
+                        draw.arc(680, 250, 50, 0, 270, (255, 120, 120), thickness=3, segments=32)
+                        draw.triangle(650, 320, 700, 320, 675, 370, (200, 120, 255), filled=True)
                 if draw.fps > 0:
                     break
                 time.sleep(0.03)
             if draw.fps <= 0:
                 raise AssertionError("Renderer did not consume Python commands")
+            # A registered but unpressed shortcut must report false, not raise.
+            if hotkey.fired:
+                raise AssertionError("Hotkey reported fired without a key press")
+            if draw.key_down("f10") and not draw.key_down("ctrl"):
+                raise AssertionError("Unexpected f10 state")
+            hotkey.close()
             fps = draw.fps
             if orphan:
                 result.write_text(str(process.pid), encoding="utf-8")

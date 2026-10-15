@@ -15,6 +15,13 @@ public static class OverlayProbe {
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hwnd);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern bool PostMessageW(IntPtr hwnd, uint msg, IntPtr key, IntPtr data);
+    // Start-Process with redirected output leaves Process.ExitCode unreadable after the
+    // process exits, so the exit code is read from a handle opened before the wait.
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetExitCodeProcess(IntPtr handle, out uint code);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool CloseHandle(IntPtr handle);
+    public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+    public const uint SYNCHRONIZE = 0x00100000;
     public static IntPtr Find(uint wanted) {
         IntPtr found = IntPtr.Zero;
         EnumWindows((hwnd, data) => { uint pid; GetWindowThreadProcessId(hwnd, out pid); if (pid == wanted && IsWindowVisible(hwnd)) { found = hwnd; return false; } return true; }, IntPtr.Zero);
@@ -26,7 +33,12 @@ foreach ($mode in @('demo','listen')) {
     $startArgs = @{ FilePath = $Executable; WorkingDirectory = $projectRoot; PassThru = $true; WindowStyle = 'Hidden'; RedirectStandardOutput = (Join-Path $logDirectory "$mode.stdout.log"); RedirectStandardError = (Join-Path $logDirectory "$mode.stderr.log") }
     if ($mode -eq 'listen') { $startArgs.ArgumentList = '--listen' }
     $overlayProcess = Start-Process @startArgs
-    $processHandle = $overlayProcess.Handle # Retain the native handle so .NET can read the exit code.
+    # Open our own handle to the process: Process.Handle is $null here, and Process.ExitCode
+    # is unreadable after exit when Start-Process redirected the output streams.
+    $processHandle = [OverlayProbe]::OpenProcess(
+        [OverlayProbe]::PROCESS_QUERY_LIMITED_INFORMATION -bor [OverlayProbe]::SYNCHRONIZE, $false,
+        [uint32]$overlayProcess.Id)
+    if ($processHandle -eq [IntPtr]::Zero) { throw 'Cannot open the overlay process handle' }
     try {
         $window = [IntPtr]::Zero
         for ($attempt = 0; $attempt -lt 50 -and $window -eq [IntPtr]::Zero; $attempt++) {
@@ -46,9 +58,18 @@ foreach ($mode in @('demo','listen')) {
         if (-not [OverlayProbe]::GetWindowDisplayAffinity($window, [ref]$affinity) -or $affinity -ne 17) { throw 'Show affinity mismatch' }
         [void][OverlayProbe]::PostMessageW($window, 0x0312, [IntPtr]1, [IntPtr]::Zero)
         if (-not $overlayProcess.WaitForExit(5000)) { throw 'Quit command timed out' }
-        if ($overlayProcess.ExitCode -ne 0 -or [OverlayProbe]::IsWindow($window)) { throw "Exit/cleanup failed: exit=$($overlayProcess.ExitCode), window=$([OverlayProbe]::IsWindow($window))" }
+        # Process.ExitCode is unreadable here because Start-Process redirected the output;
+        # read the code from the native handle retained before the wait instead.
+        $exitCode = [uint32]0
+        if (-not [OverlayProbe]::GetExitCodeProcess($processHandle, [ref]$exitCode)) {
+            throw "Cannot read exit code: $([ComponentModel.Win32Exception]::new([Runtime.InteropServices.Marshal]::GetLastWin32Error()).Message)"
+        }
+        if ($exitCode -ne 0 -or [OverlayProbe]::IsWindow($window)) {
+            throw "Exit/cleanup failed: exit=$exitCode, window=$([OverlayProbe]::IsWindow($window))"
+        }
         Write-Output "PASS $mode`: startup, affinity 0x11, hide/show keeps affinity, clean quit."
     } finally {
+        if ($processHandle -ne [IntPtr]::Zero) { [void][OverlayProbe]::CloseHandle($processHandle) }
         if (-not $overlayProcess.HasExited) { Stop-Process -Id $overlayProcess.Id }
         $overlayProcess.Dispose()
     }

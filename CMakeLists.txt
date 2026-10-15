@@ -10,7 +10,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(DWM_OVERLAY_OUTPUT_NAME "overlay_python" CACHE STRING "Renderer executable name")
 add_executable(overlay_demo
     src/overlay_demo.cpp src/CDwmMsg.cpp src/CIMGuiDraw.cpp
-    src/MyImGui.cpp src/save_state.cpp
+    src/MyImGui.cpp src/save_state.cpp src/DwmPrimitives.cpp src/DwmFontLibrary.cpp
     vendor/imgui/imgui.cpp vendor/imgui/imgui_draw.cpp
     vendor/imgui/imgui_widgets.cpp vendor/imgui/imgui_impl_dx11.cpp)
 target_include_directories(overlay_demo PRIVATE src vendor/imgui)
@@ -28,12 +28,13 @@ target_compile_options(draw_example PRIVATE /W3 /utf-8)
 set_target_properties(draw_example PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin")
-add_library(dwm_scroll STATIC src/DwmScrollPanel.cpp)
+add_library(dwm_scroll STATIC src/DwmScrollPanel.cpp src/DwmHotkeys.cpp)
 target_include_directories(dwm_scroll PUBLIC src vendor/imgui)
 target_compile_definitions(dwm_scroll PUBLIC UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(dwm_scroll PRIVATE /W3 /utf-8)
 target_link_libraries(dwm_scroll PUBLIC user32)
 add_library(dwm_draw SHARED src/python_api.cpp src/CDwmMsg.cpp)
+# DwmHotkeys.cpp lives in dwm_scroll; dwm_draw links it and must not compile it twice.
 target_link_libraries(dwm_draw PRIVATE dwm_scroll)
 target_compile_options(dwm_draw PRIVATE /W3 /utf-8)
 set_target_properties(dwm_draw PROPERTIES
@@ -47,13 +48,23 @@ set_target_properties(scroll_example PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin")
 include(CTest)
 if(BUILD_TESTING)
-    add_executable(drawing_api_test tests/drawing_api.cpp src/CDwmMsg.cpp)
+    add_executable(drawing_api_test tests/drawing_api.cpp src/CDwmMsg.cpp src/DwmHotkeys.cpp)
     target_include_directories(drawing_api_test PRIVATE src vendor/imgui)
     target_compile_definitions(drawing_api_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(drawing_api_test PRIVATE /W3 /utf-8)
+    target_link_libraries(drawing_api_test PRIVATE user32)
     add_test(NAME drawing_api COMMAND drawing_api_test)
     add_executable(scroll_panel_test tests/scroll_panel.cpp src/CDwmMsg.cpp)
     target_link_libraries(scroll_panel_test PRIVATE dwm_scroll)
     target_compile_options(scroll_panel_test PRIVATE /W3 /utf-8)
     add_test(NAME scroll_panel COMMAND scroll_panel_test)
+    # Font resolution is checked independently of the renderer: it proves families map to
+    # real font files instead of silently falling back.
+    add_executable(font_library_test tests/font_library.cpp src/DwmFontLibrary.cpp
+        vendor/imgui/imgui.cpp vendor/imgui/imgui_draw.cpp vendor/imgui/imgui_widgets.cpp)
+    target_include_directories(font_library_test PRIVATE src vendor/imgui)
+    target_compile_definitions(font_library_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(font_library_test PRIVATE /W3 /utf-8)
+    target_link_libraries(font_library_test PRIVATE user32)
+    add_test(NAME font_library COMMAND font_library_test)
 endif()
